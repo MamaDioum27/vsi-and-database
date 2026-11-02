@@ -103,8 +103,9 @@ Puis ajout d'une règle entrante HTTP (80) dans le Security Group de l'EC2.
 
 Captures d'écran :
 
-![Health check](captures/health.png)
 ![Connexion à la base](captures/database.png)
+![Security Group EC2](captures/sg-ec2.png)
+![Security Group RDS](captures/sg-rds.png)
 
 ## Problèmes rencontrés et solutions
 
