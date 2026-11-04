@@ -5,11 +5,20 @@ Configuration is read from environment variables (see .env.example).
 Never commit real credentials to Git.
 """
 import os
+import socket
 
 import psycopg2
 from flask import Flask, jsonify
 
 app = Flask(__name__)
+HOSTNAME = socket.gethostname()
+
+
+@app.after_request
+def add_served_by_header(response):
+    """Tell the client which VM answered (visible through the load balancer)."""
+    response.headers["X-Served-By"] = HOSTNAME
+    return response
 
 
 def get_connection():
@@ -40,6 +49,12 @@ def index():
 def health():
     """Lightweight check: the app is up (does not require the database)."""
     return jsonify(status="ok")
+
+
+@app.route("/whoami")
+def whoami():
+    """Identify the VM that served the request (used to demo load balancing)."""
+    return jsonify(hostname=HOSTNAME)
 
 
 if __name__ == "__main__":

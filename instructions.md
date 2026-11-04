@@ -14,14 +14,19 @@ By the end of this lab you will be able to:
 
 ```mermaid
 flowchart LR
-    U[User / Browser] -->|HTTP 8080 or 80| VM[VM: EC2 or Compute Engine<br/>Flask app]
-    A[Admin] -->|SSH 22 - your IP only| VM
-    VM -->|PostgreSQL 5432<br/>private access only| DB[(Managed PostgreSQL<br/>RDS or Cloud SQL)]
+    U[User / Browser] -->|HTTPS 443| LB[HTTPS Load Balancer<br/>ALB or Cloud Load Balancing<br/>TLS terminated here]
+    LB -->|HTTP 8080<br/>health check /health| VM1[VM 1<br/>Flask app]
+    LB -->|HTTP 8080<br/>health check /health| VM2[VM 2<br/>Flask app]
+    A[Admin] -->|SSH 22 - your IP only| VM1
+    A -->|SSH 22 - your IP only| VM2
+    VM1 -->|PostgreSQL 5432<br/>private access only| DB[(Managed PostgreSQL<br/>RDS or Cloud SQL)]
+    VM2 -->|PostgreSQL 5432<br/>private access only| DB
 ```
 
 | Component | AWS | GCP |
 |---|---|---|
-| VM (IaaS) | EC2 (Amazon Linux / Ubuntu) | Compute Engine (Ubuntu) |
+| VM (IaaS) x2 | EC2 (Amazon Linux / Ubuntu) | Compute Engine (Ubuntu) |
+| HTTPS load balancer | Application Load Balancer (ALB) + ACM certificate | External Application Load Balancer + SSL certificate |
 | Database (PaaS) | RDS for PostgreSQL | Cloud SQL for PostgreSQL |
 | Network filtering | Security Groups | VPC firewall rules |
 | CLI | AWS CLI | gcloud CLI |
@@ -98,20 +103,86 @@ Troubleshooting:
 | `password authentication failed` | Wrong `DB_USER` / `DB_PASS` |
 | `Missing environment variable` | `.env` not loaded in the current shell |
 
-### 7. Clean up (mandatory)
+### 7. Add an HTTPS load balancer in front of two VMs
+
+Goal: users reach the app only through `https://<lb-dns>`; the load balancer terminates TLS and spreads requests across **two identical VMs**. The VMs are not exposed directly any more.
+
+1. **Create a second VM** with Terraform (`count = 2` / two instances, ideally in **different zones/AZs**) and deploy the same app on both (steps 3 to 5, e.g. Ansible inventory with two hosts).
+   Each VM answers `/whoami` with its hostname and adds an `X-Served-By` header, so you can see which VM served each request.
+2. **Get a TLS certificate**
+   - With a domain: AWS ACM / GCP managed certificate (free, DNS validation).
+   - Without a domain (lab only): generate a self-signed certificate and import it (ACM import / GCP self-managed SSL certificate):
+     ```bash
+     openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+       -keyout lb.key -out lb.crt -subj "/CN=lab-lb"
+     ```
+     Never commit `lb.key`.
+3. **Create the load balancer with Terraform**
+
+   | Element | AWS | GCP |
+   |---|---|---|
+   | Load balancer | `aws_lb` (type `application`, public subnets in 2 AZs) | `google_compute_global_forwarding_rule` + `google_compute_target_https_proxy` + `google_compute_url_map` |
+   | Backends | `aws_lb_target_group` (HTTP 8080) + `aws_lb_target_group_attachment` for each VM | `google_compute_instance_group` (or unmanaged group per VM) + `google_compute_backend_service` |
+   | Health check | `/health`, HTTP 8080 | `google_compute_health_check` on `/health`, port 8080 |
+   | HTTPS listener | `aws_lb_listener` port 443, `certificate_arn` | target HTTPS proxy with `ssl_certificates` |
+   | HTTP to HTTPS (optional) | listener 80 with a redirect action | separate URL map with `https_redirect = true` |
+
+4. **Tighten the firewall rules**
+   - Load balancer: 443 (and 80 for the redirect) open to the Internet.
+   - VMs, port 8080: allowed **only from the load balancer** (AWS: source = the ALB security group; GCP: Google health-check/proxy ranges `130.211.0.0/22`, `35.191.0.0/16`).
+   - SSH (22) still restricted to your IP; PostgreSQL (5432) still reachable only from the VMs.
+5. Add the LB address to `outputs.tf` (`lb_dns_name` on AWS, forwarding rule IP on GCP).
+
+### 8. Show that the load balancing works
+
+1. **Check targets are healthy** (console, or `aws elbv2 describe-target-health --target-group-arn <arn>`): both VMs must be `healthy`.
+2. **Send repeated requests** to the load balancer with the provided script [`test-lb.sh`](test-lb.sh):
+   ```bash
+   ./test-lb.sh <lb-dns-or-ip> 20
+   ```
+   Expected output: requests alternate between the two hostnames, e.g.
+   ```text
+   request 1 -> vm-1
+   request 2 -> vm-2
+   ...
+   summary:  10 vm-1
+   summary:  10 vm-2
+   ```
+   The same check by hand: `curl -sk -i https://<lb-dns>/whoami` shows `X-Served-By: <hostname>` and the JSON body. In a browser, refresh `https://<lb-dns>/whoami` several times.
+   (`-k` is only needed with a self-signed certificate.)
+3. **Check HTTPS**: `curl -vk https://<lb-dns>/health 2>&1 | grep -E "SSL connection|subject|HTTP/"` shows the TLS handshake and the certificate.
+4. **Demonstrate high availability** (failover):
+   ```bash
+   # on VM 1
+   sudo systemctl stop <app-service>      # or: pkill -f "python app.py"
+   ```
+   Wait for the health check to mark VM 1 `unhealthy` (about 10-30 s), then run `./test-lb.sh <lb-dns-or-ip> 20` again: **all** responses now come from VM 2 and the app stays available. Restart the app on VM 1 and observe that traffic is shared again.
+5. Take screenshots: healthy targets, the `test-lb.sh` summary showing both VMs, and the failover test.
+
+Troubleshooting:
+
+| Symptom | Likely cause |
+|---|---|
+| Targets `unhealthy` | VM firewall does not allow the load balancer on 8080, or `/health` not reachable |
+| `502` / `503` from the LB | No healthy target, or the app is not listening on `0.0.0.0:8080` |
+| Always the same VM | Sticky sessions enabled, or `curl` reuses one connection (try more requests / `--no-keepalive`) |
+| Certificate warning / `curl: (60)` | Self-signed certificate: use `-k` for the lab |
+
+### 9. Clean up (mandatory)
 ```bash
 terraform destroy
 ```
-Verify in the console that no VM, database or disk remains, to avoid unexpected costs.
+Verify in the console that no VM, load balancer, database, certificate or disk remains, to avoid unexpected costs (load balancers are billed per hour).
 
 ## Deliverables
 
-- A Git repository containing: Terraform code, Ansible playbook (if used), `app.py`, `requirements.txt`
-- A short README (how to deploy) and screenshots of the working app
+- A Git repository containing: Terraform code (2 VMs, DB, HTTPS load balancer), Ansible playbook (if used), `app.py`, `requirements.txt`, `test-lb.sh`
+- A short README (how to deploy) and screenshots of the working app, the healthy targets, the load-balancing output and the failover test
 - No secrets in the repository (`.env`, `*.tfstate`, `*.tfvars`, keys must be listed in your `.gitignore`)
 
 ## Going further
 
 - Run the app as a `systemd` service so it restarts automatically
-- Add HTTPS (Let's Encrypt)
+- Use a real domain and a managed certificate (Let's Encrypt / ACM / GCP managed cert)
+- Use an auto-scaling group / managed instance group instead of two fixed VMs
 - Add a Terraform remote state backend (S3 / GCS)
