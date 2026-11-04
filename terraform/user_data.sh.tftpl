@@ -1,0 +1,41 @@
+#!/bin/bash
+# Exécuté au premier démarrage de chaque VM : installe et lance l'app Flask
+set -eux
+
+hostnamectl set-hostname ${hostname}
+
+dnf install -y python3 python3-pip git
+
+git clone ${repo_url} /opt/app
+python3 -m venv /opt/app/.venv
+/opt/app/.venv/bin/pip install -r /opt/app/requirements.txt
+
+cat > /opt/app/.env <<'EOF'
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASS=${db_pass}
+PORT=8080
+EOF
+chmod 600 /opt/app/.env
+
+cat > /etc/systemd/system/flask-app.service <<'EOF'
+[Unit]
+Description=Flask demo app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/app
+EnvironmentFile=/opt/app/.env
+ExecStart=/opt/app/.venv/bin/python app.py
+Restart=on-failure
+User=ec2-user
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now flask-app

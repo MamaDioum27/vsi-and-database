@@ -1,2 +1,9 @@
 
 .env
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.pem
+lb.key
+lb.crt
